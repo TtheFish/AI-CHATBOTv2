@@ -9,6 +9,8 @@ A complete RAG (Retrieval-Augmented Generation) system with a chatbot interface.
 - 🤖 **RAG Chatbot**: Ask questions and get answers based on your documents
 - ⚡ **FastAPI Backend**: High-performance async API
 - ⚛️ **React Frontend**: Modern, responsive UI
+- 📄 **Page-specific Queries**: Ask about specific pages (e.g., "what is on page 5")
+- 💬 **ChatGPT-like Interface**: Natural conversation support
 
 ## Project Structure
 
@@ -94,6 +96,7 @@ The frontend will be available at `http://localhost:3000`
 2. **Wait for Processing**: The document will be processed and indexed (this may take a moment)
 3. **Start Chatting**: Type questions about your document in the chat interface
 4. **Get Answers**: The system will retrieve relevant information from your document and generate responses
+5. **Page Queries**: Ask about specific pages (e.g., "what is on page 5", "last page")
 
 ## API Endpoints
 
@@ -152,4 +155,3 @@ The frontend will be available at `http://localhost:3000`
 ## License
 
 MIT License - feel free to use and modify as needed.
-
