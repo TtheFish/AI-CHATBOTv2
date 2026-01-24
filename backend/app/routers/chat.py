@@ -20,16 +20,19 @@ async def chat(request: ChatRequest):
         if conversation_id not in conversations:
             conversations[conversation_id] = []
         
-        # Add user message to conversation
+        # Add user message BEFORE querying to include it in history (optional, or pass current separately)
+        # Here we pass the history UP TO this point (excluding current if we want, or including)
+        # Let's include current message in history so RAG sees it as "latest"
+        current_history = conversations[conversation_id] + [{"role": "user", "content": request.message}]
+        
+        # Get RAG response with History
+        response, sources = rag_service.query(request.message, history=current_history)
+        
+        # Now Append to storage
         conversations[conversation_id].append({
             "role": "user",
             "content": request.message
         })
-        
-        # Get RAG response
-        response, sources = rag_service.query(request.message)
-        
-        # Add assistant response to conversation
         conversations[conversation_id].append({
             "role": "assistant",
             "content": response
@@ -41,6 +44,7 @@ async def chat(request: ChatRequest):
             sources=sources
         )
     except Exception as e:
+        print(f"Chat Error: {e}")
         raise HTTPException(status_code=500, detail=f"Error processing chat: {str(e)}")
 
 
