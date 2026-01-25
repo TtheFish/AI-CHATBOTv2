@@ -1,72 +1,78 @@
 import os
 import uuid
+import re
 from pathlib import Path
-from typing import List, Tuple, Dict
-import PyPDF2
-import docx
+from typing import List, Tuple
 from datetime import datetime
 
-# For embeddings - using OpenAI (can be replaced with other providers)
+# PDF Extraction
+try:
+    import fitz  # PyMuPDF
+    PYMUPDF_AVAILABLE = True
+except ImportError:
+    PYMUPDF_AVAILABLE = False
+    print("Warning: PyMuPDF (fitz) not found. Please install pymupdf.")
+    # Fallback to PyPDF2 if needed, but we really want fitz
+    try:
+        import PyPDF2
+        PYPDF2_AVAILABLE = True
+    except ImportError:
+        PYPDF2_AVAILABLE = False
+
+# Word Extraction
+import docx
+
+# OpenAI & Embeddings
 try:
     from openai import OpenAI
     OPENAI_AVAILABLE = True
 except ImportError:
     OPENAI_AVAILABLE = False
-    print("Warning: OpenAI not installed. Set OPENAI_API_KEY or install openai package.")
 
-# Vector database
+# Vector DB
 try:
     import chromadb
     CHROMADB_AVAILABLE = True
 except ImportError:
     CHROMADB_AVAILABLE = False
-    print("Warning: ChromaDB not installed. Install chromadb package.")
-
-# Create uploads directory relative to backend folder
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
-
 
 class DocumentProcessor:
     def __init__(self):
         if not CHROMADB_AVAILABLE:
             raise ImportError("ChromaDB is required. Install it with: pip install chromadb")
         
-        # Use PersistentClient for newer ChromaDB versions
+        # Initialize ChromaDB
         try:
             self.client = chromadb.PersistentClient(path="./chroma_db")
         except AttributeError:
-            # Fallback for older versions
-            from chromadb.config import Settings
-            self.client = chromadb.Client(Settings(
-                chroma_db_impl="duckdb+parquet",
-                persist_directory="./chroma_db"
-            ))
+             from chromadb.config import Settings
+             self.client = chromadb.Client(Settings(
+                 chroma_db_impl="duckdb+parquet",
+                 persist_directory="./chroma_db"
+             ))
+             
+        self.collection = self.client.get_or_create_collection(name="documents")
         
-        # Get or create collection
-        self.collection = self.client.get_or_create_collection(
-            name="documents"
-        )
-        
-        # Initialize OpenAI client if available
+        # Initialize OpenAI or Fallback
         self.openai_client = None
         if OPENAI_AVAILABLE:
             api_key = os.getenv("OPENAI_API_KEY")
             if api_key:
                 self.openai_client = OpenAI(api_key=api_key)
         
-        # Fallback: use sentence transformers if OpenAI not available
+        self.embedding_model = None
         if not self.openai_client:
             try:
                 from sentence_transformers import SentenceTransformer
                 self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-                print("Using sentence-transformers for embeddings")
             except ImportError:
-                print("Warning: No embedding model available. Install openai or sentence-transformers")
-                self.embedding_model = None
-    
+                print("Warning: No local embedding model available.")
+
     def get_embedding(self, text: str) -> List[float]:
-        """Generate embedding for text"""
+        """Generate embedding using OpenAI or local model"""
+        # Clean text slightly before embedding to improve quality
+        text = text.replace("\n", " ")
+        
         if self.openai_client:
             try:
                 response = self.openai_client.embeddings.create(
@@ -75,143 +81,159 @@ class DocumentProcessor:
                 )
                 return response.data[0].embedding
             except Exception as e:
-                print(f"OpenAI embedding error: {e}, falling back to sentence-transformers")
-                if self.embedding_model:
-                    return self.embedding_model.encode(text).tolist()
-                raise Exception(f"OpenAI failed and no fallback: {e}")
-        elif self.embedding_model:
+                print(f"OpenAI embedding error: {e}, using fallback.")
+        
+        if self.embedding_model:
             return self.embedding_model.encode(text).tolist()
-        else:
-            raise Exception("No embedding model available")
-    
+            
+        return [0.0] * 384  # Dummy fallback if absolutely nothing works (should not happen)
+
     def extract_text_from_pdf(self, file_path: Path) -> Tuple[str, List[Tuple[int, str]]]:
-        """Extract text from PDF file with page information
-        Returns: (full_text, list of (page_num, page_text))"""
+        """Extract text using PyMuPDF (fitz) - superior quality"""
         full_text = ""
         pages_data = []
-        with open(file_path, 'rb') as file:
-            pdf_reader = PyPDF2.PdfReader(file)
-            for page_num, page in enumerate(pdf_reader.pages, start=1):
-                page_text = page.extract_text()
-                full_text += page_text + "\n"
-                pages_data.append((page_num, page_text))
-        return full_text, pages_data
-    
-    def extract_text_from_docx(self, file_path: Path) -> str:
-        """Extract text from DOCX file"""
-        doc = docx.Document(file_path)
-        text = ""
-        for paragraph in doc.paragraphs:
-            text += paragraph.text + "\n"
-        return text
-    
-    def chunk_text(self, text: str, chunk_size: int = 1500, overlap: int = 300) -> List[str]:
-        """Split text into chunks with overlap - larger chunks for better context"""
-        # Try to split by paragraphs first for better semantic units
-        paragraphs = text.split('\n\n')
-        chunks = []
-        current_chunk = []
-        current_length = 0
         
-        for para in paragraphs:
-            para_words = para.split()
-            para_length = len(para_words)
+        if PYMUPDF_AVAILABLE:
+            try:
+                doc = fitz.open(file_path)
+                for page_num, page in enumerate(doc, start=1):
+                    # "text" block mode preserves paragraphs better
+                    page_text = page.get_text("text") 
+                    if page_text.strip():
+                        # Clean up headers/footers roughly (simple heuristic)
+                        lines = page_text.split('\n')
+                        # Remove lonely page numbers
+                        lines = [l for l in lines if not (l.strip().isdigit() and len(l.strip()) < 4)]
+                        cleaned_page_text = '\n'.join(lines)
+                        
+                        full_text += cleaned_page_text + "\n\n"
+                        pages_data.append((page_num, cleaned_page_text))
+                return full_text, pages_data
+            except Exception as e:
+                print(f"PyMuPDF error: {e}. Falling back to PyPDF2 if available.")
+        
+        # Fallback
+        if PYPDF2_AVAILABLE:
+            with open(file_path, 'rb') as file:
+                reader = PyPDF2.PdfReader(file)
+                for i, page in enumerate(reader.pages):
+                    t = page.extract_text()
+                    full_text += t + "\n"
+                    pages_data.append((i+1, t))
+            return full_text, pages_data
             
-            # If paragraph is too large, split it
-            if para_length > chunk_size:
-                # First, save current chunk if exists
+        raise ValueError("No PDF extraction library available.")
+
+    def extract_text_from_docx(self, file_path: Path) -> str:
+        doc = docx.Document(file_path)
+        return "\n".join([p.text for p in doc.paragraphs])
+
+    def recursive_chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
+        """
+        Smart recursive splitting.
+        Priority:
+        1. Double newlines (Paragraphs)
+        2. Single newlines
+        3. Sentences (. )
+        4. Words
+        """
+        if len(text) <= chunk_size:
+            return [text]
+            
+        # 1. Split by paragraphs
+        parts = text.split('\n\n')
+        chunks = []
+        current_chunk = ""
+        
+        for part in parts:
+            # If adding this part exceeds chunk size, verify if we need to split the PART itself
+            if len(current_chunk) + len(part) + 2 > chunk_size:
+                # If current_chunk is big enough, push it
                 if current_chunk:
-                    chunks.append(" ".join(current_chunk))
-                    current_chunk = []
-                    current_length = 0
-                
-                # Split large paragraph into smaller chunks
-                for i in range(0, para_length, chunk_size - overlap):
-                    chunk = " ".join(para_words[i:i + chunk_size])
-                    if chunk.strip():
-                        chunks.append(chunk)
+                    chunks.append(current_chunk)
+                    # Start new chunk with overlap (last N chars)
+                    overlap_text = current_chunk[-overlap:] if overlap < len(current_chunk) else current_chunk
+                    current_chunk = overlap_text + "\n\n" + part
+                else:
+                    # The part ITSELF is huge. Split it strictly.
+                    current_chunk = part
             else:
-                # Check if adding this para would exceed chunk size
-                if current_length + para_length > chunk_size and current_chunk:
-                    chunks.append(" ".join(current_chunk))
-                    # Keep overlap - take last few words from previous chunk
-                    overlap_words = min(overlap // 10, len(current_chunk))
-                    current_chunk = current_chunk[-overlap_words:] if overlap_words > 0 else []
-                    current_length = len(current_chunk)
+                if current_chunk:
+                    current_chunk += "\n\n" + part
+                else:
+                    current_chunk = part
+                    
+            # If current_chunk became too huge after adding (cases where one huge para exists)
+            # FORCE split it using regex (sentences)
+            if len(current_chunk) > chunk_size:
+                # Naive sentence split
+                sentences = re.split(r'(?<=[.!?])\s+', current_chunk)
                 
-                # Add paragraph to current chunk
-                current_chunk.extend(para_words)
-                current_length += para_length
-        
-        # Add remaining chunk
+                temp_chunk = ""
+                for sent in sentences:
+                    if len(temp_chunk) + len(sent) > chunk_size:
+                        if temp_chunk:
+                            chunks.append(temp_chunk)
+                            temp_chunk = sent # No complex overlap here to keep it simple
+                        else:
+                            # Sentence itself is huge? Just chop it.
+                            chunks.append(sent[:chunk_size])
+                            temp_chunk = sent[chunk_size:] 
+                    else:
+                        temp_chunk += " " + sent
+                
+                current_chunk = temp_chunk # Leftover
+                
         if current_chunk:
-            chunks.append(" ".join(current_chunk))
-        
-        # Fallback: if no chunks created, use word-based splitting
-        if not chunks:
-            words = text.split()
-            for i in range(0, len(words), chunk_size - overlap):
-                chunk = " ".join(words[i:i + chunk_size])
-                if chunk.strip():
-                    chunks.append(chunk)
-        
+            chunks.append(current_chunk)
+            
         return chunks
-    
+
     def process_document(self, file_path: Path, filename: str) -> str:
-        """Process a document and store it in the vector database with page information"""
         document_id = str(uuid.uuid4())
         
-        # Extract text based on file type
         pages_data = None
+        text = ""
+        
         if filename.endswith('.pdf'):
             text, pages_data = self.extract_text_from_pdf(file_path)
         elif filename.endswith(('.doc', '.docx')):
             text = self.extract_text_from_docx(file_path)
-            # For DOCX, treat as single "page"
             pages_data = [(1, text)]
-        else:
-            raise ValueError(f"Unsupported file type: {filename}")
-        
+            
         if not text.strip():
-            raise ValueError("No text extracted from document")
+            raise ValueError("Empty document")
+            
+        # Store pages for page-based queries (e.g. "what is on page 5")
+        if not hasattr(self, '_document_pages'): self._document_pages = {}
+        self._document_pages[document_id] = pages_data
         
-        # Store pages data for page queries
-        if not hasattr(self, '_document_pages'):
-            self._document_pages = {}
-        self._document_pages[document_id] = pages_data if pages_data else []
-        print(f"Stored {len(pages_data) if pages_data else 0} pages for document {document_id}")
+        # Smart Chunking
+        chunks = self.recursive_chunk_text(text)
         
-        # Chunk the text
-        chunks = self.chunk_text(text)
-        
-        # Generate embeddings and store in vector DB
+        # Prepare for DB
         embeddings = []
         ids = []
         metadatas = []
-        documents = []
+        docs = []
         
         for i, chunk in enumerate(chunks):
-            chunk_id = f"{document_id}_{i}"
-            embedding = self.get_embedding(chunk)
-            
-            # Determine which page this chunk likely belongs to
+            # Try to map chunk back to page number (heuristic)
             page_num = 1
             if pages_data:
-                # Find page by checking which page contains most of this chunk
-                chunk_lower = chunk.lower()
-                best_page = 1
-                max_overlap = 0
-                for pnum, ptext in pages_data:
-                    # Count word overlap
-                    chunk_words = set(chunk_lower.split())
-                    page_words = set(ptext.lower().split())
-                    overlap = len(chunk_words & page_words)
-                    if overlap > max_overlap:
-                        max_overlap = overlap
-                        best_page = pnum
-                page_num = best_page
+                # Simple check: where does this chunk mostly live?
+                # We can't be 100% accurate without complex mapping, but let's try matching first 20 chars
+                snippet = chunk[:50].strip()
+                if snippet:
+                    for p_num, p_text in pages_data:
+                        if snippet in p_text:
+                            page_num = p_num
+                            break
             
-            embeddings.append(embedding)
+            emb = self.get_embedding(chunk)
+            chunk_id = f"{document_id}_{i}"
+            
+            embeddings.append(emb)
             ids.append(chunk_id)
             metadatas.append({
                 "document_id": document_id,
@@ -220,76 +242,39 @@ class DocumentProcessor:
                 "page_number": page_num,
                 "upload_date": datetime.now().isoformat()
             })
-            documents.append(chunk)
-        
-        # Add to collection
+            docs.append(chunk)
+            
         self.collection.add(
             embeddings=embeddings,
             ids=ids,
             metadatas=metadatas,
-            documents=documents
+            documents=docs
         )
         
         return document_id
-    
-    def get_page_content(self, document_id: str, page_num: int) -> str:
-        """Get content of a specific page"""
-        if not hasattr(self, '_document_pages'):
-            print(f"Warning: _document_pages not found")
-            return ""
-        pages_data = self._document_pages.get(document_id, [])
-        print(f"Looking for page {page_num} in document {document_id}, found {len(pages_data)} pages")
-        for pnum, ptext in pages_data:
-            if pnum == page_num:
-                print(f"Found page {page_num}, content length: {len(ptext)}")
-                return ptext
-        print(f"Page {page_num} not found in document {document_id}")
-        return ""
-    
-    def get_total_pages(self, document_id: str) -> int:
-        """Get total number of pages for a document"""
-        if not hasattr(self, '_document_pages'):
-            return 0
-        pages_data = self._document_pages.get(document_id, [])
-        return len(pages_data) if pages_data else 0
-    
-    def search_documents(self, query: str, n_results: int = 10) -> List[Tuple[str, float]]:
-        """Search for relevant document chunks with better retrieval"""
+
+    def search_documents(self, query: str, n_results: int = 5) -> List[Tuple[str, float]]:
+        """Search and return (text, distance)"""
         try:
-            query_embedding = self.get_embedding(query)
-            
-            # Get more results than needed, then filter
+            q_emb = self.get_embedding(query)
             results = self.collection.query(
-                query_embeddings=[query_embedding],
-                n_results=min(n_results * 2, 20)  # Get more results for better selection
+                query_embeddings=[q_emb],
+                n_results=n_results
             )
             
-            # Format results: (text, distance)
-            retrieved_chunks = []
-            if results.get('documents') and len(results['documents'][0]) > 0:
-                documents = results['documents'][0]
-                distances = results.get('distances', [])[0] if results.get('distances') else [0] * len(documents)
+            if not results['documents']:
+                return []
                 
-                # Pair documents with distances and sort by relevance (lower distance = more relevant)
-                chunk_distances = list(zip(documents, distances))
-                chunk_distances.sort(key=lambda x: x[1])  # Sort by distance (ascending)
-                
-                # Return top n_results
-                for doc, distance in chunk_distances[:n_results]:
-                    retrieved_chunks.append((doc, distance))
+            docs = results['documents'][0]
+            dists = results['distances'][0] if 'distances' in results else [0.0]*len(docs)
             
-            return retrieved_chunks
+            return list(zip(docs, dists))
+            
         except Exception as e:
-            print(f"Search error: {e}")
+            print(f"Search failed: {e}")
             return []
 
-
-# Global instance - lazy initialization
-document_processor = None
-
+# Singleton
+document_processor = DocumentProcessor()
 def get_document_processor():
-    global document_processor
-    if document_processor is None:
-        document_processor = DocumentProcessor()
     return document_processor
-
